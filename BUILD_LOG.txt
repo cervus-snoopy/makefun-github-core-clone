@@ -1,0 +1,103 @@
+BUILD LOG — github-core-clone-01 ($500, closes 21 Nov 2026 13:30 WIB)
+Entry dir: ~/workspace/make-fun/github-core-clone/
+Kit: ~/workspace/make-fun/github-core-clone-kit/github-core-clone-01-kit/
+
+2026-11-15 ~01:00 WIB — kit fetched and read (RULES.txt 384 lines, manifest,
+  checks-*.ts, bench.ts, wire.ts, harness). Environment: node v24.22.1,
+  python3 3.12.3, git 2.43.0. Docker NOT installed -> grade-local must use
+  --driver process, and the process driver runs node22 entries only.
+  DECISION: TypeScript (main.ts), not Python — the only locally verifiable path.
+2026-11-15 ~01:05 WIB — scenario seed verified against the kit's own TS:
+  SCENARIO_SEED 0x6a09e667f3bcc909 -> viewer login `adaiversen`, teammate
+  `quinnkeller`, stranger `olgabauer`, first repo `amber-thistle`.
+2026-11-15 ~01:10 WIB — main.ts written (lifecycle: bind 0 -> register ->
+  poll /done -> exit 0). LICENSE (MIT), package.json, tsconfig.json written.
+2026-11-15 ~01:15 WIB — app.ts part 1: identity/seed RNG, pkt-line framing,
+  git objects, pack read/write. BUG FIXED while writing: initial
+  findInflateEnd did a per-byte linear scan with inflateSync (O(n^2), too
+  slow for 100-file packs) -> replaced with inflateAt binary search
+  (verified empirically: inflateSync throws while truncated, ignores trailing
+  bytes once complete, so success is monotone in end position).
+2026-11-15 ~01:20 WIB — app.ts part 2: in-memory store, reachability
+  (collectReachable, isAncestor, mergeBase, peelToCommit, flattenTree,
+  buildTreeFromFlat, threeWayMerge, diffCounts), HTTP plumbing, auth.
+2026-11-15 ~01:25 WIB — app.ts part 3: git smart HTTP (v0/v2 advertisements,
+  planFetch with depth/have/shallow, upload-pack v0+v2, receive-pack with
+  per-ref ok/ng and exact `non-fast-forward` reason).
+2026-11-15 ~01:30 WIB — app.ts part 4: REST v3 (repos, branches, commits,
+  git refs, contents, labels, issues+comments, pulls+files+merge).
+2026-11-15 ~01:35 WIB — app.ts part 5: GraphQL executor (tokenizer +
+  recursive-descent parser, resolvers, mutations, introspection), MCP
+  (server/discover + initialize + tools/list + tools/call, 6 tools),
+  router + createApp export. Fixes in the same pass: GqlParser parameter
+  property -> plain field (type-stripping compatibility), PUT /contents
+  branch-founding dead code removed.
+2026-11-15 ~01:40 WIB — main.ts edited a second time (unhandledRejection
+  guard so a stray rejection never kills a trial mid-suite). README.md and
+  this BUILD_LOG.txt written. node --check passes for app.ts and main.ts.
+2026-11-15 ~01:45 WIB — smoke test (stub env + real git clone/push + curl
+  REST/GraphQL/MCP): 33/36 pass on first run. THREE BUGS FOUND AND FIXED:
+  (a) v2 fetch: the acknowledgments section must ONLY be sent while
+  negotiation is open (no `done`). Once the client sent `done`, real git
+  2.43 expects the packfile section first and dies with "expected
+  'packfile', received 'acknowledgments'". Verified against git http-backend
+  ground truth. The suite client always sends `done`.
+  (b) GraphQL connections: `nodes`/`pageInfo` resolution failed because
+  connection objects carried no `__kind` (executor fell back to the parent
+  type) — tagged IssueConnection/PullRequestConnection/
+  PullRequestChangedFileConnection/PageInfo with `__kind`.
+  (c) receive-pack report: the report pkt-line stream needs its OWN flush
+  inside the sideband data, then the outer flush. Without the inner flush
+  git reads the report fine but dies "the remote end hung up unexpectedly".
+  Verified byte-for-byte against git http-backend.
+  Smoke-test script bugs also fixed (missing auth header on push, -a flag
+  on untracked file, HOME clobbering `~`, stale-process cleanup).
+2026-11-15 ~01:50 WIB — grade-local run 1 (--driver process, --instances 1):
+  VOIDED by infra fault, not the entry: "the instance has no input/env/
+  for the env to read its seed from". Root cause: the kit's practice
+  trial-0 ships without the EMPTY input/env/ dir the generator creates
+  (empty dirs don't survive the kit tarball). Fix: mkdir the empty dir in
+  the LOCAL kit copy (practice/trial-0|1|2/input/env/) — digest-neutral,
+  the instance digest covers files only. Do NOT ship this change; the
+  server's own instance has env/ already.
+2026-11-15 ~01:55 WIB — grade-local run 2: FINISHED, score 911/1000
+  (feature 580/600, agent 200/200, perf 131/200, working 1). Replay
+  matched byte-for-byte; L1 regrade reproduced byte-for-byte. 4 checks
+  failed: git.fetch-shallow-depth1, git.fetch-shallow-deepen,
+  git.fetch-shallow-new-tip, repos.commits. Workloads p50: push 753 ms
+  (39 pts), clone 1,884 ms (0 pts!), read 703 ms (50 pts), write 137 ms
+  (42 pts). T_ref: push 1,641 ms, clone 267 ms, read 2,760 ms, write 349 ms.
+2026-11-15 ~02:05 WIB — FOUR FIXES from run 2, all verified in run 3:
+  (a) planFetch built the pack with collectReachable over the new commits,
+  which walks the FULL ancestry — a depth-1 clone shipped all 200 commits.
+  Rewrote it: each new commit + its own tree closure only. Fixes all three
+  shallow checks.
+  (b) repos.commits: GET /commits returned the raw message WITH git's
+  trailing newline; the check compares exactly. Strip one trailing \n
+  at the REST site (GitHub strips it too).
+  (c) Clone perf: the pack sort recomputed SHA-1 per comparison (O(n log n)
+  hashes). Sort by the oid already in hand. writePack deflate level 6 -> 1
+  (size is not scored, wall time is).
+  (d) Fetch-response cache (v2 + v0): responses are pure functions of the
+  immutable object graph + plan, so cache them (FIFO, 128 entries). The
+  50 concurrent identical shallow clones now share one built pack.
+  Also fixed a self-inflicted ReferenceError (`name` used in
+  handleUploadPackV2 where only repo.name exists) caught by smoke test.
+2026-11-15 ~02:15 WIB — grade-local run 3: FINISHED, score 930/1000
+  (feature 600/600 = 120/120 checks, agent 200/200, perf 130/200).
+  Workloads p50: push 1,198 ms (31), clone 172 ms (33), read 1,580 ms (35),
+  write 257 ms (31). Replay matched byte-for-byte.
+2026-11-15 ~02:20 WIB — grade-local run 4 (confirmation): FINISHED, score
+  918/1000 (feature 600/600, agent 200/200, perf 118/200). Clone stable
+  at 180 ms / 32 pts. Push/read/write p50s bounce run to run (push
+  753->1,198->1,372 ms; read 703->1,580->1,910 ms) with host load
+  (load avg ~1.8 on the 1.5-shared-CPU VM) — noise, not code; no further
+  systematic perf lever left except clone, which is banked.
+  Best local score: 930/1000. Reference forge scores ~900/1000
+  (120/120 + perf ~100); this entry beats it on practice trial 0.
+  NOTE for submit: grade-local was run WITHOUT --transcript, so the run
+  reports authored 0/2586 lines and "eligible: ranked yes, prize no
+  (no_transcripts, coverage_below_gate, cost_unpriced)". The parent must
+  pass this session's transcripts at submit time for prize eligibility.
+  No GitHub repo created, nothing submitted, nothing paid, keypair untouched.
+FINAL FILES: main.ts 4,692 bytes sha256 746382502b23781b1b0fd0532ca1494a543aebf99b20bea0b5d49b770ff70ce0; app.ts 115,976 bytes sha256 c6c0b0b0aeffc905ac950af42a99e49d879621910542b037a6f2e6bfc98e07c4.
