@@ -101,3 +101,94 @@ Kit: ~/workspace/make-fun/github-core-clone-kit/github-core-clone-01-kit/
   pass this session's transcripts at submit time for prize eligibility.
   No GitHub repo created, nothing submitted, nothing paid, keypair untouched.
 FINAL FILES: main.ts 4,692 bytes sha256 746382502b23781b1b0fd0532ca1494a543aebf99b20bea0b5d49b770ff70ce0; app.ts 115,976 bytes sha256 c6c0b0b0aeffc905ac950af42a99e49d879621910542b037a6f2e6bfc98e07c4.
+
+================================================================
+REBUILD — Go static binary (19 Nov 2026, Ady order: attack p50 ONLY)
+================================================================
+Old Node entry (score 930 best, p50 706,473 µs, rank 7,743) REPLACED
+in-session from scratch: app.ts deleted; all Go sources + new main.ts
+authored in this session (NO-COPAS — old code never read).
+
+What was built: Go 1.25.4 static binary `forge` (2,924,728 bytes stripped,
+CGO_ENABLED=0 -trimpath -ldflags="-s -w") + thin Node launcher main.ts.
+Raw TCP HTTP/1.1 (no net/http, no encoding/json), one in-memory store,
+cached pack/fetch/advertisement responses (FIFO 128, per-repo generation),
+cached serialized issue/repo JSON, deflate level 1, one request guard.
+
+Smoke tests (stub env + curl + real git 2.43): REST/GraphQL/MCP all pass;
+clone/push/shallow/deepen/tag/non-FF-reject/delete-branch all verified
+against real git. FOUR BUGS FOUND AND FIXED in smoke:
+(a) receive-pack: readPktLines ran over the whole body incl. the pack
+    ("PACK" is not a pkt-line header) -> HTTP 400. Parse commands only
+    up to the first flush; pack starts after it.
+(b) ls-refs: git clone sends `ref-prefix HEAD` — HEAD line was only
+    emitted with no prefixes. Emit HEAD when any prefix matches "HEAD".
+(c) v2 fetch without `done`: real git expects an acknowledgments-ONLY
+    response, then it POSTs again with `done`. Sending the packfile in
+    the same response dies "expected response end packet". (Suite client
+    always sends `done`, so this only affects real git.)
+(d) depth fetch: tag roots were dropped from the send set (only commits
+    + trees). A want naming a tag object must ship the tag itself.
+Also: readPack re-walked + re-inflated the whole pack a second time to
+resolve OFS bases -> single pass with recorded positions + recursive
+OFS resolver (correct for chained deltas).
+
+grade-local run 1 (rebuild): FINISHED, score 975/1000
+  feature 600/600, agent 200/200, perf 175/200, p50 281,559 µs.
+  Workloads p50: push 637 ms (42), clone 136 ms (37), read 713 ms (49),
+  write 102 ms (47). Replay matched byte-for-byte; L1 regrade reproduced
+  byte-for-byte. Trial kept:
+  /home/hatch/.makefun/trials/github-core-clone-01/01a1f25e-3885-74fd-a225-f81981338cc6
+  Beats leaderboard #1 (970, p50 305,639 µs) on local grade.
+  Remaining headroom is mostly client/VM noise: rounds bounce
+  (push 556-811 ms, read 556-1,019 ms) on the 1.5-shared-CPU VM.
+  NOTE: run without --transcript (parent passes transcripts at submit).
+FINAL FILES (rebuild): main.go, json.go, gitobj.go, store.go, githttp.go,
+  rest.go, rest2.go, graphql.go, graphql2.go, mcp.go, go.mod, main.ts,
+  package.json, tsconfig.json, README.md (with 3 live make.fun badges),
+  LICENSE, forge (built binary, 2,924,728 bytes).
+
+grade-local run 2 (committed a8bbc53): FINISHED, score 985/1000
+  feature 595/600, agent 200/200, perf 190/200, p50 187,618 µs.
+  git.fetch-shallow-deepen = 0 (only miss); all other groups maxed.
+  Trial kept:
+  /home/hatch/.makefun/trials/github-core-clone-01/01a1f260-3b19-76a5-b09c-08cc1a3479de
+
+grade-local runs 3-9 (uncommitted fix, NOT graded — see below): feature 595,
+deepen still 0 in grade-local, although the kit's own deepen check passed
+when run directly against a live forge (all 30 git checks + all 5 shallow
+fetch checks pass in isolation). Root cause of the confusion: grade-local
+grades the COMMIT, not the worktree ("the server grades the commit;
+--worktree grades the files as they are"). The fix sat uncommitted, so
+grade-local kept running the old committed binary. Lesson: commit before
+every grade-local run.
+
+BUG (e) shallow-fetch have-closure (found 19 Nov, fixed in store.go):
+planFetch excluded the FULL closure of haves from the send set. For a
+deepen-2 fetch the client holds the tip + its tree but NOT the tip's
+parents — yet the full closure contains the parent, so the parent was
+excluded as "already held" and the server shipped an EMPTY pack (correct
+shallow-info, zero objects). Fix: haveClosure() walks haves but never
+follows the parents of commits named in the client's shallow list
+(boundary commits). A full (depth 0) fetch on a shallow repo now also
+unshallows the old boundary. Verified with the kit's own GitClient:
+deepen delivers parent + tree, not the grandparent; boundary moves.
+Also verified: fetch-shallow-depth1, fetch-shallow-new-tip,
+fetch-incremental, fetch-nothing-new all pass via the kit's check code.
+
+grade-local run 10 (committed a56967a): FINISHED, score 952/1000
+  feature 600/600, agent 200/200, perf 152/200, p50 392,106 µs.
+  120/120 checks pass; git.fetch-shallow-deepen = 1. Trial kept:
+  /home/hatch/.makefun/trials/github-core-clone-01/01a1f273-b106-7504-a4f2-136459890c89
+
+grade-local run 11 (committed a56967a, confirmation): FINISHED, score 970/1000
+  feature 600/600, agent 200/200, perf 170/200, p50 304,043 µs.
+  120/120 checks pass. Workloads p50: push ~512 ms (46), clone ~137 ms (37),
+  read ~1,076 ms (42), write ~115 ms (45). Trial kept:
+  /home/hatch/.makefun/trials/github-core-clone-01/01a1f274-587c-759c-83e5-826c5c5d39e5
+  Local score ties leaderboard #1 (970, p50 305,639 µs).
+  NOTE: runs without --transcript (parent passes transcripts at submit).
+FINAL FILES (rebuild): main.go, json.go, gitobj.go, store.go, githttp.go,
+  rest.go, rest2.go, graphql.go, graphql2.go, mcp.go, go.mod, main.ts,
+  package.json, tsconfig.json, README.md (with 3 live make.fun badges),
+  LICENSE, forge (built binary, 2,928,824 bytes, stripped).
