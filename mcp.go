@@ -1,6 +1,7 @@
-// MCP over POST /mcp: JSON-RPC 2.0, modern server/discover era with a legacy
-// initialize fallback, and the six required tools.
 package main
+
+// MCP (Model Context Protocol): JSON-RPC 2.0 over HTTP at /mcp,
+// with six tools.
 
 import (
 	"strconv"
@@ -10,7 +11,9 @@ import (
 const mcpServerName = "github-core-clone"
 const mcpServerVersion = "1.0.0"
 
-const mcpToolsJSON = `{"tools":[` +
+// toolsListJSON is the pre-built tools/list result, emitted
+// byte-for-byte.
+const toolsListJSON = `{"tools":[` +
 	`{"name":"create_repo","description":"Create a new repository","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Repository name"},"owner":{"type":"string","description":"Repository owner"},"description":{"type":"string","description":"Repository description"},"private":{"type":"boolean","description":"Whether the repository is private"}},"required":["name"]}},` +
 	`{"name":"get_repo","description":"Get a repository","inputSchema":{"type":"object","properties":{"owner":{"type":"string","description":"Repository owner"},"repo":{"type":"string","description":"Repository name"}},"required":["owner","repo"]}},` +
 	`{"name":"create_issue","description":"Create an issue in a repository","inputSchema":{"type":"object","properties":{"owner":{"type":"string","description":"Repository owner"},"repo":{"type":"string","description":"Repository name"},"title":{"type":"string","description":"Issue title"},"body":{"type":"string","description":"Issue body"}},"required":["owner","repo","title"]}},` +
@@ -19,214 +22,262 @@ const mcpToolsJSON = `{"tools":[` +
 	`{"name":"merge_pull_request","description":"Merge a pull request","inputSchema":{"type":"object","properties":{"owner":{"type":"string","description":"Repository owner"},"repo":{"type":"string","description":"Repository name"},"pull_number":{"type":"integer","description":"Pull request number"}},"required":["owner","repo","pull_number"]}}` +
 	`]}`
 
-func mcpHandler(req *httpRequest) *httpResponse {
+// rpcResult renders a JSON-RPC success envelope.
+func rpcResult(id *V, result string) response {
+	return response{status: 200, ctype: "application/json; charset=utf-8",
+		body: []byte(`{"jsonrpc":"2.0","id":` + marshalV(id) + `,"result":` + result + `}`)}
+}
+
+// rpcError renders a JSON-RPC error envelope.
+func rpcError(id *V, code int, msg string) response {
+	return response{status: 200, ctype: "application/json; charset=utf-8",
+		body: []byte(`{"jsonrpc":"2.0","id":` + marshalV(id) + `,"error":{"code":` + strconv.Itoa(code) + `,"message":` + jstr(msg) + `}}`)}
+}
+
+// toolResult renders a tools/call result envelope. The text field
+// is the JSON encoding of the value; structuredContent is the
+// value itself. isError appears only on tool-level errors.
+func toolResult(id *V, valueJSON string, isError bool) response {
+	var b strings.Builder
+	b.WriteString(`{"jsonrpc":"2.0","id":`)
+	b.WriteString(marshalV(id))
+	b.WriteString(`,"result":{"content":[{"type":"text","text":`)
+	b.WriteString(jstr(valueJSON))
+	b.WriteString(`}],"structuredContent":`)
+	b.WriteString(valueJSON)
+	if isError {
+		b.WriteString(`,"isError":true`)
+	}
+	b.WriteString(`}}`)
+	return response{status: 200, ctype: "application/json; charset=utf-8", body: []byte(b.String())}
+}
+
+// toolErr renders a tool-level error result.
+func toolErr(id *V, msg string) response {
+	return toolResult(id, `{"error":`+jstr(msg)+`}`, true)
+}
+
+// handleMCP serves every method on /mcp.
+func handleMCP(req *request, store *Store) response {
 	if req.method == "DELETE" {
-		return jsonResp(200, []byte(`{}`))
+		return jsonOK("{}")
 	}
 	if req.method != "POST" {
 		return jsonErr(405, "Method Not Allowed")
 	}
-	body, ok := parseJSON(req.body)
+	body, ok := parseJSON(string(req.body))
 	if !ok {
-		return &httpResponse{status: 400, ctype: "application/json", body: []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}`)}
+		return response{status: 400, ctype: "application/json; charset=utf-8",
+			body: []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}`)}
 	}
-	method := body.get("method").strOr("")
-	id := body.get("id")
-	idJSON := "null"
-	if id != nil {
-		idJSON = jvalToJSON(id)
+	id := body.Get("id")
+	if id == nil {
+		id = nullV()
 	}
+	method := body.StrField("method", "")
 	if strings.HasPrefix(method, "notifications/") {
-		return &httpResponse{status: 202, ctype: "application/json", noBody: true}
-	}
-	result := func(inner string) *httpResponse {
-		return jsonResp(200, []byte(`{"jsonrpc":"2.0","id":`+idJSON+`,"result":`+inner+`}`))
-	}
-	errResp := func(code int, msg string) *httpResponse {
-		var sb strings.Builder
-		sb.WriteString(`{"jsonrpc":"2.0","id":`)
-		sb.WriteString(idJSON)
-		sb.WriteString(`,"error":{"code":`)
-		sb.WriteString(strconv.Itoa(code))
-		sb.WriteString(`,"message":`)
-		jsonEscape(&sb, msg)
-		sb.WriteString(`}}`)
-		return jsonResp(200, []byte(sb.String()))
+		return response{status: 202, ctype: "application/json; charset=utf-8", body: nil}
 	}
 	switch method {
 	case "server/discover":
-		return result(`{"supportedVersions":["2026-07-28","2025-11-25"],"capabilities":{"tools":{}},"serverInfo":{"name":` + jsonString(mcpServerName) + `,"version":` + jsonString(mcpServerVersion) + `},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":` + jsonString(mcpServerName) + `,"version":` + jsonString(mcpServerVersion) + `}}}`)
+		return rpcResult(id, `{"supportedVersions":["2026-07-28","2025-11-25"],"capabilities":{"tools":{}},"serverInfo":{"name":"github-core-clone","version":"1.0.0"},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"github-core-clone","version":"1.0.0"}}}`)
 	case "initialize":
-		params := body.get("params")
-		ver := "2025-11-25"
-		if params != nil {
-			if v := params.get("protocolVersion"); v != nil && v.kind == 's' {
-				switch v.str {
+		proto := "2025-11-25"
+		if params := body.Get("params"); params != nil {
+			if v := params.StrField("protocolVersion", ""); v != "" {
+				switch v {
 				case "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05":
-					ver = v.str
+					proto = v
 				}
 			}
 		}
-		return result(`{"protocolVersion":` + jsonString(ver) + `,"capabilities":{"tools":{}},"serverInfo":{"name":` + jsonString(mcpServerName) + `,"version":` + jsonString(mcpServerVersion) + `}}`)
-	case "tools/list":
-		return result(mcpToolsJSON)
-	case "tools/call":
-		return mcpCall(body, idJSON)
+		return rpcResult(id, `{"protocolVersion":`+jstr(proto)+`,"capabilities":{"tools":{}},"serverInfo":{"name":"github-core-clone","version":"1.0.0"}}`)
 	case "ping":
-		return result(`{}`)
+		return rpcResult(id, `{}`)
+	case "tools/list":
+		return rpcResult(id, toolsListJSON)
+	case "tools/call":
+		return mcpCall(req, store, body, id)
+	default:
+		return rpcError(id, -32601, "Method not found: "+method)
 	}
-	return errResp(-32601, "Method not found: "+method)
 }
 
-func mcpCall(body *jval, idJSON string) *httpResponse {
-	errResp := func(code int, msg string) *httpResponse {
-		var sb strings.Builder
-		sb.WriteString(`{"jsonrpc":"2.0","id":`)
-		sb.WriteString(idJSON)
-		sb.WriteString(`,"error":{"code":`)
-		sb.WriteString(strconv.Itoa(code))
-		sb.WriteString(`,"message":`)
-		jsonEscape(&sb, msg)
-		sb.WriteString(`}}`)
-		return jsonResp(200, []byte(sb.String()))
+// mcpCall handles tools/call.
+func mcpCall(req *request, store *Store, body *V, id *V) response {
+	params := body.Get("params")
+	if params == nil || params.Kind != 'o' {
+		return rpcError(id, -32602, "missing params")
 	}
-	callResult := func(textJSON string, isError bool) *httpResponse {
-		var sb strings.Builder
-		sb.WriteString(`{"jsonrpc":"2.0","id":`)
-		sb.WriteString(idJSON)
-		sb.WriteString(`,"result":{"content":[{"type":"text","text":`)
-		sb.WriteString(jsonString(textJSON))
-		sb.WriteString(`}],"structuredContent":`)
-		sb.WriteString(textJSON)
-		if isError {
-			sb.WriteString(`,"isError":true`)
+	name := params.StrField("name", "")
+	args := params.Get("arguments")
+	if args == nil || args.Kind != 'o' {
+		args = objV()
+	}
+	// Required-string validation, in the order of each tool's
+	// required list. pull_number is validated separately.
+	needStr := func(arg string) (string, bool) {
+		s := args.StrField(arg, "")
+		if s == "" {
+			return "", false
 		}
-		sb.WriteString(`}}`)
-		return jsonResp(200, []byte(sb.String()))
-	}
-	params := body.get("params")
-	if params == nil {
-		return errResp(-32602, "missing params")
-	}
-	name := params.get("name").strOr("")
-	args := params.get("arguments")
-	if args == nil {
-		args = &jval{kind: 'o', obj: make(map[string]*jval)}
-	}
-	need := func(keys ...string) string {
-		for _, k := range keys {
-			v := args.get(k)
-			if v == nil || (v.kind == 's' && v.str == "") {
-				return k
-			}
-		}
-		return ""
-	}
-	isErr := func(msg string) *httpResponse {
-		return callResult(`{"error":`+jsonString(msg)+`}`, true)
+		return s, true
 	}
 	switch name {
 	case "create_repo":
-		if missing := need("name"); missing != "" {
-			return isErr("missing required argument: " + missing)
+		nm, ok := needStr("name")
+		if !ok {
+			return toolErr(id, "missing required argument: name")
 		}
-		owner := args.get("owner").strOr(viewerLogin)
+		owner := args.StrField("owner", viewerLogin)
 		if owner == "" {
 			owner = viewerLogin
 		}
-		r, ok := store.createRepo(owner, args.get("name").strOr(""), args.get("description").strOr(""), args.get("private").boolOr(false))
-		if !ok {
-			return isErr("Repository already exists")
+		if store.getRepo(owner, nm) != nil {
+			return toolErr(id, "Repository already exists")
 		}
-		return callResult(string(store.repoJSON(r)), false)
+		repo := store.createRepo(owner, nm, args.StrField("description", ""), args.BoolField("private", false))
+		return toolResult(id, repo.repoJSON(), false)
 	case "get_repo":
-		if missing := need("owner", "repo"); missing != "" {
-			return isErr("missing required argument: " + missing)
+		owner, ok1 := needStr("owner")
+		if !ok1 {
+			return toolErr(id, "missing required argument: owner")
 		}
-		r := store.findRepo(args.get("owner").strOr(""), args.get("repo").strOr(""))
-		if r == nil {
-			return isErr("Repository not found")
+		rp, ok2 := needStr("repo")
+		if !ok2 {
+			return toolErr(id, "missing required argument: repo")
 		}
-		return callResult(string(store.repoJSON(r)), false)
+		repo := store.getRepo(owner, rp)
+		if repo == nil {
+			return toolErr(id, "Repository not found")
+		}
+		return toolResult(id, repo.repoJSON(), false)
 	case "create_issue":
-		if missing := need("owner", "repo", "title"); missing != "" {
-			return isErr("missing required argument: " + missing)
+		owner, ok1 := needStr("owner")
+		if !ok1 {
+			return toolErr(id, "missing required argument: owner")
 		}
-		r := store.findRepo(args.get("owner").strOr(""), args.get("repo").strOr(""))
-		if r == nil {
-			return isErr("Repository not found")
+		rp, ok2 := needStr("repo")
+		if !ok2 {
+			return toolErr(id, "missing required argument: repo")
 		}
-		is, errMsg := store.createIssue(r, args.get("title").strOr(""), args.get("body").strOr(""), nil)
-		if errMsg != "" {
-			return isErr(errMsg)
+		title, ok3 := needStr("title")
+		if !ok3 {
+			return toolErr(id, "missing required argument: title")
 		}
-		return callResult(string(store.issueJSON(r, is)), false)
+		repo := store.getRepo(owner, rp)
+		if repo == nil {
+			return toolErr(id, "Repository not found")
+		}
+		is := &Issue{
+			Number: repo.NextNum,
+			ID:     store.NextObjID,
+			Title:  title,
+			Body:   args.StrField("body", ""),
+			State:  "open",
+		}
+		repo.NextNum++
+		store.NextObjID++
+		repo.Issues = append(repo.Issues, is)
+		repo.bump()
+		return toolResult(id, is.issueJSON(repo), false)
 	case "list_issues":
-		if missing := need("owner", "repo"); missing != "" {
-			return isErr("missing required argument: " + missing)
+		owner, ok1 := needStr("owner")
+		if !ok1 {
+			return toolErr(id, "missing required argument: owner")
 		}
-		r := store.findRepo(args.get("owner").strOr(""), args.get("repo").strOr(""))
-		if r == nil {
-			return isErr("Repository not found")
+		rp, ok2 := needStr("repo")
+		if !ok2 {
+			return toolErr(id, "missing required argument: repo")
 		}
-		state := args.get("state").strOr("open")
-		var sb strings.Builder
-		sb.WriteByte('[')
+		repo := store.getRepo(owner, rp)
+		if repo == nil {
+			return toolErr(id, "Repository not found")
+		}
+		state := args.StrField("state", "open")
+		var b strings.Builder
+		b.WriteByte('[')
 		first := true
-		for _, is := range r.Issues {
+		for _, is := range repo.Issues {
 			if state != "all" && is.State != state {
 				continue
 			}
 			if !first {
-				sb.WriteByte(',')
+				b.WriteByte(',')
 			}
 			first = false
-			sb.Write(store.issueJSON(r, is))
+			b.WriteString(is.issueJSON(repo))
 		}
-		sb.WriteByte(']')
-		return callResult(sb.String(), false)
+		b.WriteByte(']')
+		return toolResult(id, b.String(), false)
 	case "create_pull_request":
-		if missing := need("owner", "repo", "title", "head", "base"); missing != "" {
-			return isErr("missing required argument: " + missing)
+		owner, ok1 := needStr("owner")
+		if !ok1 {
+			return toolErr(id, "missing required argument: owner")
 		}
-		r := store.findRepo(args.get("owner").strOr(""), args.get("repo").strOr(""))
-		if r == nil {
-			return isErr("Repository not found")
+		rp, ok2 := needStr("repo")
+		if !ok2 {
+			return toolErr(id, "missing required argument: repo")
 		}
-		pr, errMsg := store.createPR(r, args.get("head").strOr(""), args.get("base").strOr(""), args.get("title").strOr(""), args.get("body").strOr(""))
+		title, ok3 := needStr("title")
+		if !ok3 {
+			return toolErr(id, "missing required argument: title")
+		}
+		head, ok4 := needStr("head")
+		if !ok4 {
+			return toolErr(id, "missing required argument: head")
+		}
+		base, ok5 := needStr("base")
+		if !ok5 {
+			return toolErr(id, "missing required argument: base")
+		}
+		repo := store.getRepo(owner, rp)
+		if repo == nil {
+			return toolErr(id, "Repository not found")
+		}
+		pr, errMsg := createPRFromArgs(store, repo, head, base, title, args.StrField("body", ""))
 		if errMsg != "" {
-			return isErr(errMsg)
+			return toolErr(id, errMsg)
 		}
-		return callResult(string(store.prJSON(r, pr)), false)
+		return toolResult(id, pr.prJSON(repo), false)
 	case "merge_pull_request":
-		if missing := need("owner", "repo", "pull_number"); missing != "" {
-			return isErr("missing required argument: " + missing)
+		owner, ok1 := needStr("owner")
+		if !ok1 {
+			return toolErr(id, "missing required argument: owner")
 		}
-		r := store.findRepo(args.get("owner").strOr(""), args.get("repo").strOr(""))
-		if r == nil {
-			return isErr("Repository not found")
+		rp, ok2 := needStr("repo")
+		if !ok2 {
+			return toolErr(id, "missing required argument: repo")
 		}
-		pr := r.findPR(args.get("pull_number").intOr(0))
+		pn := args.Get("pull_number")
+		if pn == nil {
+			return toolErr(id, "missing required argument: pull_number")
+		}
+		repo := store.getRepo(owner, rp)
+		if repo == nil {
+			return toolErr(id, "Repository not found")
+		}
+		num := int64(0)
+		if pn.Kind == 'n' {
+			num = int64(pn.Num)
+		}
+		pr := repo.findPR(num)
 		if pr == nil {
-			return isErr("Pull request not found")
+			return toolErr(id, "Pull request not found")
 		}
-		if !pr.Merged {
-			sha, conflict, ok := store.mergePR(r, pr)
-			if !ok {
-				return isErr("Pull request not found")
-			}
-			if conflict {
-				return isErr("Merge conflict")
-			}
-			_ = sha
+		if pr.Merged {
+			return toolResult(id, `{"number":`+strconv.FormatInt(pr.Number, 10)+`,"merged":true,"sha":`+jstr(pr.MergeSHA)+`,"state":"closed"}`, false)
 		}
-		var sb strings.Builder
-		sb.WriteString(`{"number":`)
-		sb.WriteString(strconv.Itoa(pr.Number))
-		sb.WriteString(`,"merged":true,"sha":`)
-		jsonEscape(&sb, pr.MergeSHA)
-		sb.WriteString(`,"state":"closed"}`)
-		return callResult(sb.String(), false)
+		sha, st := repo.tryMerge(pr, false)
+		switch st {
+		case mergeOK:
+			return toolResult(id, `{"number":`+strconv.FormatInt(pr.Number, 10)+`,"merged":true,"sha":`+jstr(sha)+`,"state":"closed"}`, false)
+		case mergeConflict:
+			return toolErr(id, "Merge conflict")
+		default:
+			return toolErr(id, "Pull request not found")
+		}
+	default:
+		return rpcError(id, -32601, "Unknown tool: "+name)
 	}
-	return errResp(-32601, "Unknown tool: "+name)
 }

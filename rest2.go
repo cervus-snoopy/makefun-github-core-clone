@@ -1,5 +1,7 @@
-// REST v3 part 2: contents (files), issues, pull requests.
 package main
+
+// REST API v3 (part two): contents, issues + comments, pull
+// requests.
 
 import (
 	"encoding/base64"
@@ -7,614 +9,579 @@ import (
 	"strings"
 )
 
-// resolveRef turns a ref name (branch), a commit sha, or "" (default branch)
-// into a commit oid.
-func resolveRef(r *repo, ref string) (string, bool) {
-	if ref == "" {
-		return r.defaultTip()
-	}
-	if oid, ok := r.refTip("refs/heads/" + ref); ok {
-		return oid, true
-	}
-	if o := r.getObject(ref); o != nil {
-		if o.typ == objCommit {
-			return ref, true
-		}
-		if o.typ == objTag {
-			target, _, _, _, _ := parseTag(o.data)
-			if to := r.getObject(target); to != nil && to.typ == objCommit {
-				return target, true
-			}
-		}
-	}
-	return "", false
-}
+// ---- contents ----
 
-// dirEntries lists the entries of a directory inside a tree.
-func dirEntries(r *repo, treeOID, dirPath string) ([]treeEntry, bool) {
-	oid := treeOID
-	if dirPath != "" {
-		for _, part := range strings.Split(dirPath, "/") {
-			o := r.getObject(oid)
-			if o == nil || o.typ != objTree {
-				return nil, false
-			}
-			found := false
-			for _, e := range parseTree(o.data) {
-				if e.name == part && e.mode == "40000" {
-					oid = e.oid
-					found = true
-					break
-				}
-			}
-			if !found {
-				return nil, false
-			}
-		}
-	}
-	o := r.getObject(oid)
-	if o == nil || o.typ != objTree {
-		return nil, false
-	}
-	return parseTree(o.data), true
-}
-
-func baseName(path string) string {
-	if i := strings.LastIndexByte(path, '/'); i >= 0 {
-		return path[i+1:]
-	}
-	return path
-}
-
-func contentsRoute(req *httpRequest, r *repo, sub []string) *httpResponse {
+// contentsEndpoint serves GET/PUT/DELETE .../contents/{path...}.
+func contentsEndpoint(req *request, store *Store, repo *Repo, sub []string) response {
 	path := strings.Join(sub, "/")
 	switch req.method {
 	case "GET":
-		return contentsGet(req, r, path)
+		return contentsGet(req, repo, path)
 	case "PUT":
-		return contentsPut(req, r, path)
+		return contentsPut(req, store, repo, path)
 	case "DELETE":
-		return contentsDelete(req, r, path)
+		return contentsDelete(req, store, repo, path)
 	}
 	return jsonErr(404, "Not Found")
 }
 
-func contentsGet(req *httpRequest, r *repo, path string) *httpResponse {
-	tip, ok := resolveRef(r, queryValue(req.query, "ref"))
-	if !ok {
-		return jsonErr(404, "Not Found")
-	}
-	treeOID := parseCommit(r.getObject(tip).data).tree
-	if path == "" {
-		entries, _ := dirEntries(r, treeOID, "")
-		return jsonResp(200, dirListJSON(r, "", entries))
-	}
-	flat := flattenTree(r.getObject, treeOID)
-	if leaf, ok := flat[path]; ok {
-		o := r.getObject(leaf.oid)
-		var sb strings.Builder
-		sb.WriteString(`{"type":"file","encoding":"base64","size":`)
-		sb.WriteString(strconv.Itoa(len(o.data)))
-		sb.WriteString(`,"name":`)
-		jsonEscape(&sb, baseName(path))
-		sb.WriteString(`,"path":`)
-		jsonEscape(&sb, path)
-		sb.WriteString(`,"sha":`)
-		jsonEscape(&sb, leaf.oid)
-		sb.WriteString(`,"content":`)
-		jsonEscape(&sb, base64.StdEncoding.EncodeToString(o.data))
-		sb.WriteByte('}')
-		return jsonResp(200, []byte(sb.String()))
-	}
-	if entries, ok := dirEntries(r, treeOID, path); ok {
-		return jsonResp(200, dirListJSON(r, path, entries))
-	}
-	return jsonErr(404, "Not Found")
-}
-
-func dirListJSON(r *repo, dirPath string, entries []treeEntry) []byte {
-	var sb strings.Builder
-	sb.WriteByte('[')
-	for i, e := range entries {
-		if i > 0 {
-			sb.WriteByte(',')
+// dirEntries lists the immediate children of a directory in a
+// tree, in stored (git-sorted) order.
+func (r *Repo) dirEntries(treeOID, dir string) ([]string, bool) {
+	if dir == "" {
+		o := r.getObject(treeOID)
+		if o == nil || o.Type != "tree" {
+			return nil, false
 		}
-		typ := "file"
-		if e.mode == "40000" {
-			typ = "dir"
+		var out []string
+		for _, e := range parseTree(o.Data) {
+			out = append(out, dirEntryJSON(r, e, e.Name))
 		}
-		p := e.name
-		if dirPath != "" {
-			p = dirPath + "/" + e.name
+		return out, true
+	}
+	// Walk down the tree by path components.
+	cur := treeOID
+	parts := strings.Split(dir, "/")
+	for _, part := range parts {
+		o := r.getObject(cur)
+		if o == nil || o.Type != "tree" {
+			return nil, false
 		}
-		sb.WriteString(`{"type":`)
-		jsonEscape(&sb, typ)
-		sb.WriteString(`,"name":`)
-		jsonEscape(&sb, e.name)
-		sb.WriteString(`,"path":`)
-		jsonEscape(&sb, p)
-		sb.WriteString(`,"sha":`)
-		jsonEscape(&sb, e.oid)
-		if typ == "file" {
-			if o := r.getObject(e.oid); o != nil {
-				sb.WriteString(`,"size":`)
-				sb.WriteString(strconv.Itoa(len(o.data)))
+		found := ""
+		for _, e := range parseTree(o.Data) {
+			if e.Name == part && e.Mode == "40000" {
+				found = e.OID
+				break
 			}
 		}
-		sb.WriteByte('}')
+		if found == "" {
+			return nil, false
+		}
+		cur = found
 	}
-	sb.WriteByte(']')
-	return []byte(sb.String())
+	o := r.getObject(cur)
+	if o == nil || o.Type != "tree" {
+		return nil, false
+	}
+	var out []string
+	for _, e := range parseTree(o.Data) {
+		out = append(out, dirEntryJSON(r, e, dir+"/"+e.Name))
+	}
+	return out, true
 }
 
-func contentsPut(req *httpRequest, r *repo, path string) *httpResponse {
-	body, errResp := parseBody(req)
-	if errResp != nil {
-		return errResp
+func dirEntryJSON(r *Repo, e TreeEntry, fullPath string) string {
+	typ := "file"
+	if e.Mode == "40000" {
+		typ = "dir"
+	}
+	var b strings.Builder
+	b.WriteString(`{"type":`)
+	b.WriteString(jstr(typ))
+	b.WriteString(`,"name":`)
+	b.WriteString(jstr(e.Name))
+	b.WriteString(`,"path":`)
+	b.WriteString(jstr(fullPath))
+	b.WriteString(`,"sha":`)
+	b.WriteString(jstr(e.OID))
+	if typ == "file" {
+		if o := r.getObject(e.OID); o != nil && o.Type == "blob" {
+			b.WriteString(`,"size":`)
+			b.WriteString(strconv.Itoa(len(o.Data)))
+		}
+	}
+	b.WriteString(`}`)
+	return b.String()
+}
+
+func contentsGet(req *request, repo *Repo, path string) response {
+	tip := repo.resolveRef(req.query("ref"))
+	if tip == "" {
+		return jsonErr(404, "Not Found")
+	}
+	treeOID := repo.treeOfCommit(tip)
+	flat := repo.flattenTree(treeOID)
+	if fe, ok := flat[path]; ok {
+		data := repo.blobBytes(fe.OID)
+		base := path
+		if i := strings.LastIndex(path, "/"); i >= 0 {
+			base = path[i+1:]
+		}
+		var b strings.Builder
+		b.WriteString(`{"type":"file","encoding":"base64","size":`)
+		b.WriteString(strconv.Itoa(len(data)))
+		b.WriteString(`,"name":`)
+		b.WriteString(jstr(base))
+		b.WriteString(`,"path":`)
+		b.WriteString(jstr(path))
+		b.WriteString(`,"sha":`)
+		b.WriteString(jstr(fe.OID))
+		b.WriteString(`,"content":`)
+		b.WriteString(jstr(base64.StdEncoding.EncodeToString(data)))
+		b.WriteString(`}`)
+		return jsonOK(b.String())
+	}
+	if entries, ok := repo.dirEntries(treeOID, path); ok {
+		return jsonOK("[" + strings.Join(entries, ",") + "]")
+	}
+	return jsonErr(404, "Not Found")
+}
+
+func contentsPut(req *request, store *Store, repo *Repo, path string) response {
+	body, ok := parseBodyJSON(req)
+	if !ok {
+		return jsonErr(400, "Invalid JSON")
 	}
 	if path == "" {
 		return jsonErr(422, "path is required")
 	}
-	message := body.get("message").strOr("")
-	contentB64 := body.get("content").strOr("")
-	clean := strings.Map(func(c rune) rune {
-		if c == '\r' || c == '\n' || c == '\t' || c == ' ' {
-			return -1
-		}
-		return c
-	}, contentB64)
-	raw, err := base64.StdEncoding.DecodeString(clean)
+	content, err := decodeB64(body.StrField("content", ""))
 	if err != nil {
 		return jsonErr(400, "invalid base64 content")
 	}
-	branch := body.get("branch").strOr("main")
+	message := body.StrField("message", "")
+	branch := body.StrField("branch", "main")
 	if branch == "" {
 		branch = "main"
 	}
-	shaParam := body.get("sha").strOr("")
-	// Current state of the branch.
-	tip, hasTip := r.refTip("refs/heads/" + branch)
-	flat := make(map[string]treeLeaf)
-	if hasTip {
-		if o := r.getObject(tip); o != nil && o.typ == objCommit {
-			flat = flattenTree(r.getObject, parseCommit(o.data).tree)
-		}
+	sha := body.StrField("sha", "")
+	// Determine the parent commit and starting tree.
+	var parent string
+	var flat map[string]FileEntry
+	if tip, ok := repo.Refs["refs/heads/"+branch]; ok {
+		parent = tip
+		flat = repo.flattenTree(repo.treeOfCommit(tip))
 	} else if branch != "main" {
-		// Founding a new branch: base it on the default branch tip.
-		if dt, ok := r.defaultTip(); ok {
-			if o := r.getObject(dt); o != nil && o.typ == objCommit {
-				tip = dt
-				hasTip = true
-				flat = flattenTree(r.getObject, parseCommit(o.data).tree)
-			}
+		if mainTip, ok := repo.Refs["refs/heads/main"]; ok {
+			parent = mainTip
+			flat = repo.flattenTree(repo.treeOfCommit(mainTip))
+		} else {
+			flat = map[string]FileEntry{}
 		}
+	} else {
+		flat = map[string]FileEntry{}
 	}
-	existing, hasExisting := flat[path]
-	if shaParam != "" && (!hasExisting || shaParam != existing.oid) {
+	existed := false
+	if fe, ok := flat[path]; ok {
+		existed = true
+		if sha != "" && fe.OID != sha {
+			return jsonErr(409, "sha does not match")
+		}
+	} else if sha != "" {
 		return jsonErr(409, "sha does not match")
 	}
-	blobOID := r.putObject(&gitObject{typ: objBlob, data: raw})
-	flat[path] = treeLeaf{oid: blobOID, mode: "100644"}
-	treeOID := buildTreeFromFlat(func(oid string, o *gitObject) { r.putObject(o) }, flat)
-	if !strings.HasSuffix(message, "\n") {
-		message += "\n"
+	blobOID := repo.putObject("blob", content)
+	flat[path] = FileEntry{OID: blobOID, Mode: "100644"}
+	treeOID := repo.buildTreeFromFlat(flat)
+	msg := message
+	if !strings.HasSuffix(msg, "\n") {
+		msg += "\n"
 	}
 	var parents []string
-	if hasTip {
-		parents = []string{tip}
+	if parent != "" {
+		parents = []string{parent}
 	}
-	commitOID := r.putObject(&gitObject{typ: objCommit, data: buildCommit(treeOID, parents, fixedWho, fixedWho, message)})
-	r.setRef("refs/heads/"+branch, commitOID)
-	var sb strings.Builder
-	sb.WriteString(`{"content":{"name":`)
-	jsonEscape(&sb, baseName(path))
-	sb.WriteString(`,"path":`)
-	jsonEscape(&sb, path)
-	sb.WriteString(`,"sha":`)
-	jsonEscape(&sb, blobOID)
-	sb.WriteString(`,"size":`)
-	sb.WriteString(strconv.Itoa(len(raw)))
-	sb.WriteString(`,"encoding":"base64","type":"file"},"commit":{"sha":`)
-	jsonEscape(&sb, commitOID)
-	sb.WriteString(`,"message":`)
-	jsonEscape(&sb, strings.TrimSuffix(message, "\n"))
-	sb.WriteString(`}}`)
+	commitOID := repo.putObject("commit", buildCommit(treeOID, parents, msg))
+	repo.setRef("refs/heads/"+branch, commitOID)
+	base := path
+	if i := strings.LastIndex(path, "/"); i >= 0 {
+		base = path[i+1:]
+	}
+	var b strings.Builder
+	b.WriteString(`{"content":{"name":`)
+	b.WriteString(jstr(base))
+	b.WriteString(`,"path":`)
+	b.WriteString(jstr(path))
+	b.WriteString(`,"sha":`)
+	b.WriteString(jstr(blobOID))
+	b.WriteString(`,"size":`)
+	b.WriteString(strconv.Itoa(len(content)))
+	b.WriteString(`,"encoding":"base64","type":"file"},"commit":{"sha":`)
+	b.WriteString(jstr(commitOID))
+	b.WriteString(`,"message":`)
+	b.WriteString(jstr(strings.TrimSuffix(msg, "\n")))
+	b.WriteString(`}}`)
 	status := 201
-	if hasExisting {
+	if existed {
 		status = 200
 	}
-	return jsonResp(status, []byte(sb.String()))
+	return response{status: status, ctype: "application/json; charset=utf-8", body: []byte(b.String())}
 }
 
-func contentsDelete(req *httpRequest, r *repo, path string) *httpResponse {
-	body, errResp := parseBody(req)
-	if errResp != nil {
-		return errResp
+func contentsDelete(req *request, store *Store, repo *Repo, path string) response {
+	body, ok := parseBodyJSON(req)
+	if !ok {
+		return jsonErr(400, "Invalid JSON")
 	}
-	message := body.get("message").strOr("")
-	branch := body.get("branch").strOr("main")
+	message := body.StrField("message", "")
+	branch := body.StrField("branch", "main")
 	if branch == "" {
 		branch = "main"
 	}
-	tip, hasTip := r.refTip("refs/heads/" + branch)
-	if !hasTip {
+	tip, ok := repo.Refs["refs/heads/"+branch]
+	if !ok {
 		return jsonErr(404, "Not Found")
 	}
-	flat := flattenTree(r.getObject, parseCommit(r.getObject(tip).data).tree)
+	flat := repo.flattenTree(repo.treeOfCommit(tip))
 	if _, ok := flat[path]; !ok {
 		return jsonErr(404, "Not Found")
 	}
 	delete(flat, path)
-	treeOID := buildTreeFromFlat(func(oid string, o *gitObject) { r.putObject(o) }, flat)
-	if !strings.HasSuffix(message, "\n") {
-		message += "\n"
+	treeOID := repo.buildTreeFromFlat(flat)
+	msg := message
+	if !strings.HasSuffix(msg, "\n") {
+		msg += "\n"
 	}
-	commitOID := r.putObject(&gitObject{typ: objCommit, data: buildCommit(treeOID, []string{tip}, fixedWho, fixedWho, message)})
-	r.setRef("refs/heads/"+branch, commitOID)
-	var sb strings.Builder
-	sb.WriteString(`{"commit":{"sha":`)
-	jsonEscape(&sb, commitOID)
-	sb.WriteString(`}}`)
-	return jsonResp(200, []byte(sb.String()))
+	commitOID := repo.putObject("commit", buildCommit(treeOID, []string{tip}, msg))
+	repo.setRef("refs/heads/"+branch, commitOID)
+	return jsonOK(`{"commit":{"sha":` + jstr(commitOID) + `}}`)
 }
 
-// ---------------------------------------------------------------- issues
+// ---- issues ----
 
-func (s *storeT) createIssue(r *repo, title, body string, labels []string) (*issue, string) {
-	for _, ln := range labels {
-		if _, ok := r.Labels[ln]; !ok {
-			return nil, "Label '" + ln + "' does not exist"
-		}
-	}
-	is := &issue{
-		Number: r.NextNumber,
-		ID:     s.nextID(),
-		Title:  title,
-		Body:   body,
-		State:  "open",
-		Labels: append([]string(nil), labels...),
-	}
-	r.NextNumber++
-	r.Issues = append(r.Issues, is)
-	r.bump()
-	return is, ""
-}
-
-func issuesRoute(req *httpRequest, r *repo, sub []string) *httpResponse {
+// issuesEndpoint serves the issue routes.
+func issuesEndpoint(req *request, store *Store, repo *Repo, sub []string) response {
 	if len(sub) == 0 {
 		switch req.method {
 		case "POST":
-			return createIssueREST(req, r)
+			return createIssue(req, store, repo)
 		case "GET":
-			return listIssuesREST(req, r)
+			return listIssues(req, repo)
 		}
 		return jsonErr(404, "Not Found")
 	}
-	n, err := strconv.Atoi(sub[0])
+	n, err := strconv.ParseInt(sub[0], 10, 64)
 	if err != nil {
 		return jsonErr(404, "Not Found")
 	}
 	if len(sub) == 1 {
 		switch req.method {
 		case "GET":
-			is := r.findIssue(n)
-			if is == nil {
-				return jsonErr(404, "Not Found")
+			if is := repo.findIssue(n); is != nil {
+				return jsonOK(is.issueJSON(repo))
 			}
-			return jsonResp(200, store.issueJSON(r, is))
+			return jsonErr(404, "Not Found")
 		case "PATCH":
-			return patchIssueREST(req, r, n)
+			return patchIssue(req, repo, n)
 		}
 		return jsonErr(404, "Not Found")
 	}
 	if len(sub) == 2 && sub[1] == "comments" {
-		is := r.findIssue(n)
-		if is == nil {
-			return jsonErr(404, "Not Found")
-		}
 		switch req.method {
 		case "GET":
-			var sb strings.Builder
-			sb.WriteByte('[')
-			for i, c := range is.Comments {
-				if i > 0 {
-					sb.WriteByte(',')
+			if is := repo.findIssue(n); is != nil {
+				var b strings.Builder
+				b.WriteByte('[')
+				for i, c := range is.Comments {
+					if i > 0 {
+						b.WriteByte(',')
+					}
+					b.WriteString(commentJSON(c))
 				}
-				sb.WriteString(`{"id":`)
-				sb.WriteString(strconv.Itoa(c.ID))
-				sb.WriteString(`,"body":`)
-				jsonEscape(&sb, c.Body)
-				sb.WriteString(`,"user":{"login":`)
-				jsonEscape(&sb, viewerLogin)
-				sb.WriteString(`,"id":`)
-				sb.WriteString(strconv.Itoa(viewerID))
-				sb.WriteString(`,"type":"User"},"created_at":`)
-				jsonEscape(&sb, fixedISO)
-				sb.WriteByte('}')
+				b.WriteByte(']')
+				return jsonOK(b.String())
 			}
-			sb.WriteByte(']')
-			return jsonResp(200, []byte(sb.String()))
+			return jsonErr(404, "Not Found")
 		case "POST":
-			body, errResp := parseBody(req)
-			if errResp != nil {
-				return errResp
-			}
-			c := &comment{ID: store.nextID(), Body: body.get("body").strOr("")}
-			is.Comments = append(is.Comments, c)
-			is.cached = nil
-			var sb strings.Builder
-			sb.WriteString(`{"id":`)
-			sb.WriteString(strconv.Itoa(c.ID))
-			sb.WriteString(`,"body":`)
-			jsonEscape(&sb, c.Body)
-			sb.WriteString(`,"user":{"login":`)
-			jsonEscape(&sb, viewerLogin)
-			sb.WriteString(`,"id":`)
-			sb.WriteString(strconv.Itoa(viewerID))
-			sb.WriteString(`,"type":"User"},"created_at":`)
-			jsonEscape(&sb, fixedISO)
-			sb.WriteByte('}')
-			return jsonResp(201, []byte(sb.String()))
+			return createComment(req, store, repo, n)
 		}
 	}
 	return jsonErr(404, "Not Found")
 }
 
-func createIssueREST(req *httpRequest, r *repo) *httpResponse {
-	body, errResp := parseBody(req)
-	if errResp != nil {
-		return errResp
+func createIssue(req *request, store *Store, repo *Repo) response {
+	body, ok := parseBodyJSON(req)
+	if !ok {
+		return jsonErr(400, "Invalid JSON")
 	}
-	title := body.get("title").strOr("")
-	b := body.get("body").strOr("")
 	var labels []string
-	if lv := body.get("labels"); lv != nil && lv.kind == 'a' {
-		for _, item := range lv.arr {
-			if item.kind == 's' {
-				labels = append(labels, item.str)
-			} else if item.kind == 'o' {
-				labels = append(labels, item.get("name").strOr(""))
-			}
+	for _, item := range body.ArrField("labels") {
+		switch item.Kind {
+		case 's':
+			labels = append(labels, item.Str)
+		case 'o':
+			labels = append(labels, item.StrField("name", ""))
 		}
 	}
-	is, errMsg := store.createIssue(r, title, b, labels)
-	if errMsg != "" {
-		return jsonErr(422, errMsg)
+	for _, name := range labels {
+		if _, ok := repo.LabelMap[name]; !ok {
+			return jsonErr(422, "Label '"+name+"' does not exist")
+		}
 	}
-	return jsonResp(201, store.issueJSON(r, is))
+	is := &Issue{
+		Number: repo.NextNum,
+		ID:     store.NextObjID,
+		Title:  body.StrField("title", ""),
+		Body:   body.StrField("body", ""),
+		State:  "open",
+		Labels: labels,
+	}
+	repo.NextNum++
+	store.NextObjID++
+	repo.Issues = append(repo.Issues, is)
+	repo.bump()
+	return response{status: 201, ctype: "application/json; charset=utf-8", body: []byte(is.issueJSON(repo))}
 }
 
-func listIssuesREST(req *httpRequest, r *repo) *httpResponse {
-	state := queryValue(req.query, "state")
+func listIssues(req *request, repo *Repo) response {
+	state := req.query("state")
 	if state == "" {
 		state = "open"
 	}
-	dir := queryValue(req.query, "direction")
-	if dir == "" {
-		dir = "desc"
-	}
-	perPage, page := pageParams(req)
-	var list []*issue
-	for _, is := range r.Issues {
+	direction := req.query("direction")
+	var filtered []*Issue
+	for _, is := range repo.Issues {
 		if state == "all" || is.State == state {
-			list = append(list, is)
+			filtered = append(filtered, is)
 		}
 	}
-	// Sort by creation: desc = newest first (number desc).
-	if dir == "desc" {
-		for i, j := 0, len(list)-1; i < j; i, j = i+1, j-1 {
-			list[i], list[j] = list[j], list[i]
+	if direction == "desc" {
+		for i, j := 0, len(filtered)-1; i < j; i, j = i+1, j-1 {
+			filtered[i], filtered[j] = filtered[j], filtered[i]
 		}
 	}
-	total := len(list)
-	start := (page - 1) * perPage
-	if start > total {
-		start = total
-	}
-	end := start + perPage
-	if end > total {
-		end = total
-	}
-	var sb strings.Builder
-	sb.WriteByte('[')
+	perPage, page := parsePage(req)
+	start, end, last := paginate(len(filtered), perPage, page)
+	var b strings.Builder
+	b.WriteByte('[')
 	for i := start; i < end; i++ {
 		if i > start {
-			sb.WriteByte(',')
+			b.WriteByte(',')
 		}
-		sb.Write(store.issueJSON(r, list[i]))
+		b.WriteString(filtered[i].issueJSON(repo))
 	}
-	sb.WriteByte(']')
-	return withLink(jsonResp(200, []byte(sb.String())), linkHeader(req, perPage, page, total))
+	b.WriteByte(']')
+	resp := jsonOK(b.String())
+	if link := linkHeader(req, perPage, page, last); link != "" {
+		resp.extra = map[string]string{"Link": link}
+	}
+	return resp
 }
 
-func patchIssueREST(req *httpRequest, r *repo, n int) *httpResponse {
-	is := r.findIssue(n)
+func patchIssue(req *request, repo *Repo, n int64) response {
+	is := repo.findIssue(n)
 	if is == nil {
 		return jsonErr(404, "Not Found")
 	}
-	body, errResp := parseBody(req)
-	if errResp != nil {
-		return errResp
+	body, ok := parseBodyJSON(req)
+	if !ok {
+		return jsonErr(400, "Invalid JSON")
 	}
-	if st := body.get("state"); st != nil && st.kind == 's' {
-		if st.str == "open" || st.str == "closed" {
-			is.State = st.str
-		}
+	if f := body.Get("state"); f != nil && f.Kind == 's' && (f.Str == "open" || f.Str == "closed") {
+		is.State = f.Str
 	}
-	if t := body.get("title"); t != nil && t.kind == 's' {
-		is.Title = t.str
+	if f := body.Get("title"); f != nil && f.Kind == 's' {
+		is.Title = f.Str
 	}
-	if b := body.get("body"); b != nil && b.kind == 's' {
-		is.Body = b.str
+	if f := body.Get("body"); f != nil && f.Kind == 's' {
+		is.Body = f.Str
 	}
-	is.cached = nil
-	return jsonResp(200, store.issueJSON(r, is))
+	is.cached = ""
+	repo.bump()
+	return jsonOK(is.issueJSON(repo))
 }
 
-// ---------------------------------------------------------------- pulls
+func createComment(req *request, store *Store, repo *Repo, n int64) response {
+	is := repo.findIssue(n)
+	if is == nil {
+		return jsonErr(404, "Not Found")
+	}
+	body, ok := parseBodyJSON(req)
+	if !ok {
+		return jsonErr(400, "Invalid JSON")
+	}
+	c := &Comment{ID: store.NextObjID, Body: body.StrField("body", "")}
+	store.NextObjID++
+	is.Comments = append(is.Comments, c)
+	is.cached = ""
+	repo.bump()
+	return response{status: 201, ctype: "application/json; charset=utf-8", body: []byte(commentJSON(c))}
+}
 
-func (s *storeT) createPR(r *repo, head, base, title, body string) (*pullRequest, string) {
-	if _, ok := r.refTip("refs/heads/" + head); !ok {
+// ---- pull requests ----
+
+// pullsEndpoint serves the pull request routes.
+func pullsEndpoint(req *request, store *Store, repo *Repo, sub []string) response {
+	if len(sub) == 0 {
+		switch req.method {
+		case "POST":
+			return createPR(req, store, repo)
+		case "GET":
+			return listPRs(req, repo)
+		}
+		return jsonErr(404, "Not Found")
+	}
+	n, err := strconv.ParseInt(sub[0], 10, 64)
+	if err != nil {
+		return jsonErr(404, "Not Found")
+	}
+	if len(sub) == 1 {
+		if req.method == "GET" {
+			if pr := repo.findPR(n); pr != nil {
+				return jsonOK(pr.prJSON(repo))
+			}
+		}
+		return jsonErr(404, "Not Found")
+	}
+	if len(sub) == 2 && sub[1] == "files" {
+		if req.method != "GET" {
+			return jsonErr(404, "Not Found")
+		}
+		return prFiles(req, repo, n)
+	}
+	if len(sub) == 2 && sub[1] == "merge" {
+		if req.method != "PUT" {
+			return jsonErr(404, "Not Found")
+		}
+		return mergePR(req, repo, n)
+	}
+	return jsonErr(404, "Not Found")
+}
+
+// createPRFromArgs creates a PR with the REST validation rules,
+// returning the PR or an error message.
+func createPRFromArgs(store *Store, repo *Repo, head, base, title, body string) (*PullRequest, string) {
+	if _, ok := repo.Refs["refs/heads/"+head]; !ok {
 		return nil, "head branch does not exist"
 	}
-	if _, ok := r.refTip("refs/heads/" + base); !ok {
+	if _, ok := repo.Refs["refs/heads/"+base]; !ok {
 		return nil, "base branch does not exist"
 	}
-	for _, pr := range r.PRs {
+	for _, pr := range repo.PRs {
 		if pr.State == "open" && pr.HeadRef == head && pr.BaseRef == base {
 			return nil, "A pull request already exists for " + head
 		}
 	}
-	pr := &pullRequest{
-		Number:  r.NextNumber,
-		ID:      s.nextID(),
+	pr := &PullRequest{
+		Number:  repo.NextNum,
+		ID:      store.NextObjID,
 		Title:   title,
 		Body:    body,
 		State:   "open",
 		HeadRef: head,
 		BaseRef: base,
 	}
-	r.NextNumber++
-	r.PRs = append(r.PRs, pr)
-	r.bump()
+	repo.NextNum++
+	store.NextObjID++
+	repo.PRs = append(repo.PRs, pr)
+	repo.bump()
 	return pr, ""
 }
 
-func pullsRoute(req *httpRequest, r *repo, sub []string) *httpResponse {
-	if len(sub) == 0 {
-		switch req.method {
-		case "POST":
-			body, errResp := parseBody(req)
-			if errResp != nil {
-				return errResp
-			}
-			head := body.get("head").strOr("")
-			base := body.get("base").strOr("")
-			title := body.get("title").strOr("")
-			b := body.get("body").strOr("")
-			pr, errMsg := store.createPR(r, head, base, title, b)
-			if errMsg != "" {
-				return jsonErr(422, errMsg)
-			}
-			return jsonResp(201, store.prJSON(r, pr))
-		case "GET":
-			state := queryValue(req.query, "state")
-			if state == "" {
-				state = "open"
-			}
-			perPage, page := pageParams(req)
-			var list []*pullRequest
-			for _, pr := range r.PRs {
-				if state == "all" || pr.State == state {
-					list = append(list, pr)
-				}
-			}
-			total := len(list)
-			start := (page - 1) * perPage
-			if start > total {
-				start = total
-			}
-			end := start + perPage
-			if end > total {
-				end = total
-			}
-			var sb strings.Builder
-			sb.WriteByte('[')
-			for i := start; i < end; i++ {
-				if i > start {
-					sb.WriteByte(',')
-				}
-				sb.Write(store.prJSON(r, list[i]))
-			}
-			sb.WriteByte(']')
-			return withLink(jsonResp(200, []byte(sb.String())), linkHeader(req, perPage, page, total))
+func createPR(req *request, store *Store, repo *Repo) response {
+	body, ok := parseBodyJSON(req)
+	if !ok {
+		return jsonErr(400, "Invalid JSON")
+	}
+	pr, errMsg := createPRFromArgs(store, repo, body.StrField("head", ""), body.StrField("base", ""),
+		body.StrField("title", ""), body.StrField("body", ""))
+	if errMsg != "" {
+		return jsonErr(422, errMsg)
+	}
+	return response{status: 201, ctype: "application/json; charset=utf-8", body: []byte(pr.prJSON(repo))}
+}
+
+func listPRs(req *request, repo *Repo) response {
+	state := req.query("state")
+	if state == "" {
+		state = "open"
+	}
+	var filtered []*PullRequest
+	for _, pr := range repo.PRs {
+		if state == "all" || pr.State == state {
+			filtered = append(filtered, pr)
 		}
+	}
+	perPage, page := parsePage(req)
+	start, end, last := paginate(len(filtered), perPage, page)
+	var b strings.Builder
+	b.WriteByte('[')
+	for i := start; i < end; i++ {
+		if i > start {
+			b.WriteByte(',')
+		}
+		b.WriteString(filtered[i].prJSON(repo))
+	}
+	b.WriteByte(']')
+	resp := jsonOK(b.String())
+	if link := linkHeader(req, perPage, page, last); link != "" {
+		resp.extra = map[string]string{"Link": link}
+	}
+	return resp
+}
+
+// prDiff computes the merge-base diff for a PR, or nil when a tip
+// is missing.
+func prDiff(repo *Repo, pr *PullRequest) []FileDiff {
+	headOID, ok := repo.Refs["refs/heads/"+pr.HeadRef]
+	if !ok {
+		return nil
+	}
+	baseOID, ok := repo.Refs["refs/heads/"+pr.BaseRef]
+	if !ok {
+		return nil
+	}
+	headCommit := repo.peelToCommit(headOID)
+	baseCommit := repo.peelToCommit(baseOID)
+	if headCommit == "" || baseCommit == "" {
+		return nil
+	}
+	mb := repo.mergeBase(baseCommit, headCommit)
+	baseTree := ""
+	if mb != "" {
+		baseTree = repo.treeOfCommit(mb)
+	} else {
+		baseTree = repo.treeOfCommit(baseCommit)
+	}
+	return repo.diffTrees(baseTree, repo.treeOfCommit(headCommit))
+}
+
+func prFiles(req *request, repo *Repo, n int64) response {
+	pr := repo.findPR(n)
+	if pr == nil {
 		return jsonErr(404, "Not Found")
 	}
-	n, err := strconv.Atoi(sub[0])
-	if err != nil {
+	diffs := prDiff(repo, pr)
+	if diffs == nil {
 		return jsonErr(404, "Not Found")
 	}
-	pr := r.findPR(n)
-	if len(sub) == 1 {
-		if pr == nil {
-			return jsonErr(404, "Not Found")
+	var b strings.Builder
+	b.WriteByte('[')
+	for i, d := range diffs {
+		if i > 0 {
+			b.WriteByte(',')
 		}
-		if req.method == "GET" {
-			return jsonResp(200, store.prJSON(r, pr))
-		}
+		b.WriteString(`{"filename":`)
+		b.WriteString(jstr(d.Path))
+		b.WriteString(`,"status":`)
+		b.WriteString(jstr(d.Status))
+		b.WriteString(`,"additions":`)
+		b.WriteString(strconv.Itoa(d.Additions))
+		b.WriteString(`,"deletions":`)
+		b.WriteString(strconv.Itoa(d.Deletions))
+		b.WriteString(`,"changes":`)
+		b.WriteString(strconv.Itoa(d.Additions + d.Deletions))
+		b.WriteString(`}`)
+	}
+	b.WriteByte(']')
+	return jsonOK(b.String())
+}
+
+func mergePR(req *request, repo *Repo, n int64) response {
+	pr := repo.findPR(n)
+	if pr == nil {
 		return jsonErr(404, "Not Found")
 	}
-	if len(sub) == 2 && sub[1] == "files" && req.method == "GET" {
-		if pr == nil {
-			return jsonErr(404, "Not Found")
-		}
-		headSHA, ok1 := r.refTip("refs/heads/" + pr.HeadRef)
-		baseSHA, ok2 := r.refTip("refs/heads/" + pr.BaseRef)
-		if !ok1 || !ok2 {
-			return jsonErr(404, "Not Found")
-		}
-		mb := mergeBase(r.getObject, headSHA, baseSHA)
-		baseTree := ""
-		if mb != "" {
-			if o := r.getObject(mb); o != nil && o.typ == objCommit {
-				baseTree = parseCommit(o.data).tree
-			}
-		}
-		if baseTree == "" {
-			if o := r.getObject(baseSHA); o != nil && o.typ == objCommit {
-				baseTree = parseCommit(o.data).tree
-			}
-		}
-		headTree := ""
-		if o := r.getObject(headSHA); o != nil && o.typ == objCommit {
-			headTree = parseCommit(o.data).tree
-		}
-		diffs := diffTrees(r.getObject, baseTree, headTree)
-		var sb strings.Builder
-		sb.WriteByte('[')
-		for i, d := range diffs {
-			if i > 0 {
-				sb.WriteByte(',')
-			}
-			sb.WriteString(`{"filename":`)
-			jsonEscape(&sb, d.path)
-			sb.WriteString(`,"status":`)
-			jsonEscape(&sb, d.status)
-			sb.WriteString(`,"additions":`)
-			sb.WriteString(strconv.Itoa(d.additions))
-			sb.WriteString(`,"deletions":`)
-			sb.WriteString(strconv.Itoa(d.deletions))
-			sb.WriteString(`,"changes":`)
-			sb.WriteString(strconv.Itoa(d.additions + d.deletions))
-			sb.WriteByte('}')
-		}
-		sb.WriteByte(']')
-		return jsonResp(200, []byte(sb.String()))
+	if pr.Merged {
+		return jsonOK(`{"sha":` + jstr(pr.MergeSHA) + `,"merged":true,"message":"Pull request successfully merged"}`)
 	}
-	if len(sub) == 2 && sub[1] == "merge" && req.method == "PUT" {
-		if pr == nil {
-			return jsonErr(404, "Not Found")
-		}
-		if pr.Merged {
-			var sb strings.Builder
-			sb.WriteString(`{"sha":`)
-			jsonEscape(&sb, pr.MergeSHA)
-			sb.WriteString(`,"merged":true,"message":"Pull request successfully merged"}`)
-			return jsonResp(200, []byte(sb.String()))
-		}
-		sha, conflict, ok := store.mergePR(r, pr)
-		if !ok {
-			return jsonErr(404, "Not Found")
-		}
-		if conflict {
-			return jsonErr(405, "Merge conflict")
-		}
-		var sb strings.Builder
-		sb.WriteString(`{"sha":`)
-		jsonEscape(&sb, sha)
-		sb.WriteString(`,"merged":true,"message":"Pull request successfully merged"}`)
-		return jsonResp(200, []byte(sb.String()))
+	sha, st := repo.tryMerge(pr, false)
+	switch st {
+	case mergeOK:
+		return jsonOK(`{"sha":` + jstr(sha) + `,"merged":true,"message":"Pull request successfully merged"}`)
+	case mergeConflict:
+		return jsonErr(405, "Merge conflict")
+	default:
+		return jsonErr(404, "Not Found")
 	}
-	return jsonErr(404, "Not Found")
 }

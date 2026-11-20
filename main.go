@@ -1,44 +1,437 @@
-// Forge entrypoint: a standalone GitHub-compatible git forge in one Go process.
-//
-// Lifecycle (the harness's, not the contest's): bind an ephemeral port, POST it to
-// $MAKEFUN_ENV_URL/register, serve until GET $MAKEFUN_ENV_URL/done answers done:true,
-// then exit 0. The server is raw TCP HTTP/1.1 (no framework): one goroutine per
-// keep-alive connection, pre-serialized hot responses, and a single in-memory store.
 package main
+
+// Entry point: harness lifecycle (register / done polling), a raw
+// TCP HTTP/1.1 server, and the top-level dispatch pipeline.
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
-var reqCounter uint64
+// request is one parsed HTTP request.
+type request struct {
+	method   string
+	path     string // percent-decoded path
+	rawPath  string // path exactly as received (for Link headers)
+	queryStr string // raw query string
+	headers  map[string]string
+	host     string
+	body     []byte
+}
 
-func nextReqID() string {
-	n := atomic.AddUint64(&reqCounter, 1)
-	var b [24]byte
-	b[0] = 'r'
-	b[1] = 'e'
-	b[2] = 'q'
-	b[3] = '-'
-	s := strconv.FormatUint(n, 16)
-	copy(b[4:], s)
-	return string(b[:4+len(s)])
+// header returns a request header by lower-cased name.
+func (r *request) header(name string) string {
+	return r.headers[strings.ToLower(name)]
+}
+
+// query returns the value of the first query pair whose decoded
+// key matches; a bare key yields "".
+func (r *request) query(key string) string {
+	for _, pair := range strings.Split(r.queryStr, "&") {
+		if pair == "" {
+			continue
+		}
+		k, v := pair, ""
+		if i := strings.IndexByte(pair, '='); i >= 0 {
+			k, v = pair[:i], pair[i+1:]
+		}
+		if decodeQueryComponent(k) == key {
+			return decodeQueryComponent(v)
+		}
+	}
+	return ""
+}
+
+// response is one HTTP response to write.
+type response struct {
+	status int
+	ctype  string
+	body   []byte
+	extra  map[string]string
+}
+
+var reasonPhrases = map[int]string{
+	200: "OK",
+	201: "Created",
+	202: "Accepted",
+	204: "No Content",
+	400: "Bad Request",
+	401: "Unauthorized",
+	404: "Not Found",
+	405: "Method Not Allowed",
+	409: "Conflict",
+	422: "Unprocessable Entity",
+}
+
+var reqCounter int64
+
+// writeResponse serialises one response onto the connection.
+func writeResponse(w *bufio.Writer, resp response) {
+	n := atomic.AddInt64(&reqCounter, 1)
+	reason, ok := reasonPhrases[resp.status]
+	if !ok {
+		reason = "Status"
+	}
+	ctype := resp.ctype
+	if ctype == "" {
+		ctype = "application/json; charset=utf-8"
+	}
+	body := resp.body
+	if resp.status == 204 {
+		body = nil
+	}
+	fmt.Fprintf(w, "HTTP/1.1 %d %s\r\n", resp.status, reason)
+	fmt.Fprintf(w, "Content-Type: %s\r\n", ctype)
+	fmt.Fprintf(w, "Content-Length: %d\r\n", len(body))
+	fmt.Fprintf(w, "X-GitHub-Request-Id: req-%s\r\n", strconv.FormatInt(n, 16))
+	if len(resp.extra) > 0 {
+		keys := make([]string, 0, len(resp.extra))
+		for k := range resp.extra {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			fmt.Fprintf(w, "%s: %s\r\n", k, resp.extra[k])
+		}
+	}
+	w.WriteString("\r\n")
+	w.Write(body)
+	w.Flush()
+}
+
+// ---- URL / query decoding ----
+
+func hexVal(c byte) (int, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0'), true
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10, true
+	case c >= 'A' && c <= 'F':
+		return int(c-'A') + 10, true
+	}
+	return 0, false
+}
+
+// percentDecode decodes %XX sequences; an invalid % sequence is
+// copied through literally.
+func percentDecode(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' && i+2 < len(s) {
+			if hi, ok1 := hexVal(s[i+1]); ok1 {
+				if lo, ok2 := hexVal(s[i+2]); ok2 {
+					b.WriteByte(byte(hi<<4 | lo))
+					i += 2
+					continue
+				}
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// decodeQueryComponent decodes a query key/value: '+' becomes a
+// space, then percent-decoding.
+func decodeQueryComponent(s string) string {
+	return percentDecode(strings.ReplaceAll(s, "+", " "))
+}
+
+// ---- request reading ----
+
+const maxBody = 64 << 20
+
+// readRequest reads one request from the connection. A malformed
+// request or read error returns an error and the connection is
+// dropped silently.
+func readRequest(br *bufio.Reader) (*request, error) {
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	line = strings.TrimRight(line, "\r\n")
+	parts := strings.SplitN(line, " ", 3)
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("bad request line")
+	}
+	req := &request{
+		method:  parts[0],
+		headers: map[string]string{},
+	}
+	target := parts[1]
+	if i := strings.IndexByte(target, '?'); i >= 0 {
+		req.rawPath = target[:i]
+		req.queryStr = target[i+1:]
+	} else {
+		req.rawPath = target
+	}
+	req.path = percentDecode(req.rawPath)
+	for {
+		hline, err := br.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		hline = strings.TrimRight(hline, "\r\n")
+		if hline == "" {
+			break
+		}
+		if i := strings.IndexByte(hline, ':'); i >= 0 {
+			name := strings.ToLower(strings.TrimSpace(hline[:i]))
+			req.headers[name] = strings.TrimSpace(hline[i+1:])
+		}
+	}
+	req.host = req.headers["host"]
+	// Body.
+	if cl := req.headers["content-length"]; cl != "" {
+		n, err := strconv.Atoi(strings.TrimSpace(cl))
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("bad content-length")
+		}
+		if n > maxBody {
+			return nil, fmt.Errorf("body too large")
+		}
+		if n > 0 {
+			req.body = make([]byte, n)
+			if _, err := io.ReadFull(br, req.body); err != nil {
+				return nil, err
+			}
+		}
+	} else if strings.Contains(strings.ToLower(req.headers["transfer-encoding"]), "chunked") {
+		var body []byte
+		for {
+			sizeLine, err := br.ReadString('\n')
+			if err != nil {
+				return nil, err
+			}
+			sizeLine = strings.TrimSpace(sizeLine)
+			if i := strings.IndexByte(sizeLine, ';'); i >= 0 {
+				sizeLine = sizeLine[:i]
+			}
+			sz, err := strconv.ParseInt(sizeLine, 16, 64)
+			if err != nil || sz < 0 {
+				return nil, fmt.Errorf("bad chunk size")
+			}
+			if sz == 0 {
+				// Trailing headers until a blank line.
+				for {
+					tl, err := br.ReadString('\n')
+					if err != nil {
+						return nil, err
+					}
+					if strings.TrimRight(tl, "\r\n") == "" {
+						break
+					}
+				}
+				break
+			}
+			if int64(len(body))+sz > maxBody {
+				return nil, fmt.Errorf("body too large")
+			}
+			chunk := make([]byte, sz)
+			if _, err := io.ReadFull(br, chunk); err != nil {
+				return nil, err
+			}
+			body = append(body, chunk...)
+			// Trailing CRLF after the chunk.
+			if _, err := br.ReadString('\n'); err != nil {
+				return nil, err
+			}
+		}
+		req.body = body
+	}
+	return req, nil
+}
+
+// ---- dispatch ----
+
+var reqGuard sync.Mutex
+
+// dispatch runs one request through the pipeline: healthz, auth,
+// git, GraphQL, MCP, REST, 404.
+func dispatch(req *request, store *Store, token string) response {
+	if req.method == "GET" && req.path == "/healthz" {
+		return jsonOK(`{"status":"ok"}`)
+	}
+	if token != "" {
+		if req.header("authorization") != "Bearer "+token {
+			return jsonErr(401, "Requires authentication")
+		}
+	}
+	if handled, resp := routeGit(req, store); handled {
+		return resp
+	}
+	if req.path == "/api/graphql" {
+		if req.method != "POST" {
+			return jsonErr(405, "Method Not Allowed")
+		}
+		return handleGraphQL(req, store)
+	}
+	if req.path == "/mcp" {
+		return handleMCP(req, store)
+	}
+	if strings.HasPrefix(req.path, "/api/v3") {
+		if handled, resp := routeREST(req, store); handled {
+			return resp
+		}
+	}
+	return jsonErr(404, "Not Found")
+}
+
+func serveConn(conn net.Conn, store *Store, token string) {
+	defer conn.Close()
+	br := bufio.NewReaderSize(conn, 32<<10)
+	bw := bufio.NewWriterSize(conn, 32<<10)
+	for {
+		req, err := readRequest(br)
+		if err != nil {
+			return
+		}
+		reqGuard.Lock()
+		resp := dispatch(req, store, token)
+		reqGuard.Unlock()
+		writeResponse(bw, resp)
+		if req.header("connection") == "close" {
+			return
+		}
+	}
+}
+
+// ---- minimal harness HTTP client ----
+
+// httpCall performs one raw HTTP/1.1 request against the harness
+// base URL (path must start with "/") and returns status + body.
+func httpCall(base, method, path string, body []byte) (int, []byte, error) {
+	rest := strings.TrimPrefix(base, "http://")
+	host := rest
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		host = rest[:i]
+	}
+	conn, err := net.DialTimeout("tcp", host, 5*time.Second)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	var sb strings.Builder
+	sb.WriteString(method + " " + path + " HTTP/1.1\r\n")
+	sb.WriteString("Host: " + host + "\r\n")
+	sb.WriteString("Connection: close\r\n")
+	if method == "POST" {
+		sb.WriteString("Content-Type: application/json\r\n")
+		sb.WriteString("Content-Length: " + strconv.Itoa(len(body)) + "\r\n")
+	} else {
+		sb.WriteString("Content-Length: 0\r\n")
+	}
+	sb.WriteString("\r\n")
+	if _, err := conn.Write([]byte(sb.String())); err != nil {
+		return 0, nil, err
+	}
+	if len(body) > 0 {
+		if _, err := conn.Write(body); err != nil {
+			return 0, nil, err
+		}
+	}
+	br := bufio.NewReader(conn)
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		return 0, nil, err
+	}
+	fields := strings.SplitN(strings.TrimRight(statusLine, "\r\n"), " ", 3)
+	if len(fields) < 2 {
+		return 0, nil, fmt.Errorf("bad status line")
+	}
+	status, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return 0, nil, err
+	}
+	contentLength := 0
+	chunked := false
+	for {
+		hline, err := br.ReadString('\n')
+		if err != nil {
+			return 0, nil, err
+		}
+		hline = strings.TrimRight(hline, "\r\n")
+		if hline == "" {
+			break
+		}
+		if i := strings.IndexByte(hline, ':'); i >= 0 {
+			name := strings.ToLower(strings.TrimSpace(hline[:i]))
+			val := strings.TrimSpace(hline[i+1:])
+			if name == "content-length" {
+				contentLength, _ = strconv.Atoi(val)
+			}
+			if name == "transfer-encoding" && strings.Contains(strings.ToLower(val), "chunked") {
+				chunked = true
+			}
+		}
+	}
+	var respBody []byte
+	if chunked {
+		for {
+			sizeLine, err := br.ReadString('\n')
+			if err != nil {
+				return 0, nil, err
+			}
+			sizeLine = strings.TrimSpace(sizeLine)
+			if i := strings.IndexByte(sizeLine, ';'); i >= 0 {
+				sizeLine = sizeLine[:i]
+			}
+			sz, err := strconv.ParseInt(sizeLine, 16, 64)
+			if err != nil {
+				return 0, nil, err
+			}
+			if sz == 0 {
+				break
+			}
+			chunk := make([]byte, sz)
+			if _, err := io.ReadFull(br, chunk); err != nil {
+				return 0, nil, err
+			}
+			respBody = append(respBody, chunk...)
+			br.ReadString('\n')
+		}
+	} else if contentLength > 0 {
+		respBody = make([]byte, contentLength)
+		if _, err := io.ReadFull(br, respBody); err != nil {
+			return 0, nil, err
+		}
+	}
+	return status, respBody, nil
+}
+
+// backoff returns the retry delay for an attempt: 250ms <<
+// min(attempt, 3), capped at 2000ms.
+func backoff(attempt int) time.Duration {
+	shift := attempt
+	if shift > 3 {
+		shift = 3
+	}
+	d := 250 * time.Millisecond << uint(shift)
+	if d > 2000*time.Millisecond {
+		d = 2000 * time.Millisecond
+	}
+	return d
 }
 
 func main() {
-	envURL := strings.TrimRight(os.Getenv("MAKEFUN_ENV_URL"), "/")
+	envURL := strings.TrimSuffix(os.Getenv("MAKEFUN_ENV_URL"), "/")
 	if envURL == "" {
 		fmt.Fprintln(os.Stderr, "[forge] MAKEFUN_ENV_URL is not set")
 		os.Exit(1)
 	}
-	store = newStore(os.Getenv("MAKEFUN_SHOP_TOKEN"))
+	token := os.Getenv("MAKEFUN_SHOP_TOKEN")
+	store := newStore()
 
 	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
@@ -48,404 +441,53 @@ func main() {
 	port := ln.Addr().(*net.TCPAddr).Port
 	fmt.Fprintf(os.Stderr, "[forge] listening on port %d\n", port)
 
-	if err := register(envURL, port); err != nil {
-		fmt.Fprintln(os.Stderr, "[forge] register:", err)
-		os.Exit(1)
+	// Register, retrying forever except on a fatal 400/405.
+	attempt := 0
+	for {
+		status, _, err := httpCall(envURL, "POST", "/register", []byte(`{"port":`+strconv.Itoa(port)+`}`))
+		if err == nil && (status == 200 || status == 409) {
+			break
+		}
+		if err == nil && (status == 400 || status == 405) {
+			fmt.Fprintf(os.Stderr, "[forge] register fatal status %d\n", status)
+			os.Exit(1)
+		}
+		time.Sleep(backoff(attempt))
+		attempt++
 	}
-	fmt.Fprintln(os.Stderr, "[forge] registered; waiting for done")
+	fmt.Fprintln(os.Stderr, "[forge] registered")
 
-	// Serve in the background while the main goroutine polls /done.
 	go func() {
 		for {
-			c, err := ln.Accept()
+			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			go handleConn(c)
+			go serveConn(conn, store, token)
 		}
 	}()
 
-	waitForDone(envURL)
+	// Poll /done until the harness signals completion. The check
+	// accepts the compact substring "done":true and, for
+	// robustness, a parsed JSON body with done=true (some
+	// encoders emit {"done": true} with a space).
+	attempt = 0
+	for {
+		status, body, err := httpCall(envURL, "GET", "/done", nil)
+		done := false
+		if err == nil && status == 200 {
+			if v, ok := parseJSON(string(body)); ok && v.BoolField("done", false) {
+				done = true
+			} else if strings.Contains(string(body), `"done":true`) {
+				done = true
+			}
+		}
+		if done {
+			break
+		}
+		time.Sleep(backoff(attempt))
+		attempt++
+	}
+	fmt.Fprintln(os.Stderr, "[forge] done, shutting down")
 	ln.Close()
-	fmt.Fprintln(os.Stderr, "[forge] done")
-	os.Exit(0)
-}
-
-// ---------------------------------------------------------------- lifecycle HTTP
-// Minimal HTTP client over raw TCP (no net/http): only what register/done need.
-
-func lifecycleReq(envURL, method, path, body string) (int, []byte, error) {
-	rest := strings.TrimPrefix(envURL, "http://")
-	host := rest
-	if i := strings.IndexByte(rest, '/'); i >= 0 {
-		host = rest[:i]
-	}
-	conn, err := net.DialTimeout("tcp", host, 30*time.Second)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
-	var sb strings.Builder
-	sb.WriteString(method)
-	sb.WriteString(" ")
-	sb.WriteString(path)
-	sb.WriteString(" HTTP/1.1\r\nHost: ")
-	sb.WriteString(host)
-	sb.WriteString("\r\nConnection: close\r\n")
-	if body != "" {
-		sb.WriteString("Content-Type: application/json\r\nContent-Length: ")
-		sb.WriteString(strconv.Itoa(len(body)))
-		sb.WriteString("\r\n")
-	} else {
-		sb.WriteString("Content-Length: 0\r\n")
-	}
-	sb.WriteString("\r\n")
-	sb.WriteString(body)
-	if _, err := conn.Write([]byte(sb.String())); err != nil {
-		return 0, nil, err
-	}
-	br := bufio.NewReader(conn)
-	line, err := br.ReadString('\n')
-	if err != nil {
-		return 0, nil, err
-	}
-	parts := strings.SplitN(strings.TrimRight(line, "\r\n"), " ", 3)
-	if len(parts) < 2 {
-		return 0, nil, fmt.Errorf("bad status line %q", line)
-	}
-	status, _ := strconv.Atoi(parts[1])
-	clen := 0
-	for {
-		h, err := br.ReadString('\n')
-		if err != nil {
-			return 0, nil, err
-		}
-		h = strings.TrimRight(h, "\r\n")
-		if h == "" {
-			break
-		}
-		if i := strings.IndexByte(h, ':'); i >= 0 {
-			if strings.EqualFold(strings.TrimSpace(h[:i]), "Content-Length") {
-				clen, _ = strconv.Atoi(strings.TrimSpace(h[i+1:]))
-			}
-		}
-	}
-	var out []byte
-	if clen > 0 {
-		out = make([]byte, clen)
-		if _, err := readFull(br, out); err != nil {
-			return 0, nil, err
-		}
-	}
-	return status, out, nil
-}
-
-func readFull(r *bufio.Reader, b []byte) (int, error) {
-	n := 0
-	for n < len(b) {
-		m, err := r.Read(b[n:])
-		n += m
-		if err != nil {
-			return n, err
-		}
-	}
-	return n, nil
-}
-
-func sleepBackoff(attempt int) {
-	ms := 250 << uint(min(attempt, 3))
-	if ms > 2000 {
-		ms = 2000
-	}
-	time.Sleep(time.Duration(ms) * time.Millisecond)
-}
-
-func register(envURL string, port int) error {
-	body := `{"port":` + strconv.Itoa(port) + `}`
-	for attempt := 0; ; attempt++ {
-		status, _, err := lifecycleReq(envURL, "POST", "/register", body)
-		if err == nil && (status == 200 || status == 409) {
-			return nil
-		}
-		if err == nil && (status == 400 || status == 405) {
-			return fmt.Errorf("register answered HTTP %d", status)
-		}
-		sleepBackoff(attempt)
-	}
-}
-
-func waitForDone(envURL string) {
-	for attempt := 0; ; attempt++ {
-		status, body, err := lifecycleReq(envURL, "GET", "/done", "")
-		if err == nil && status == 200 && bytes.Contains(body, []byte(`"done":true`)) {
-			return
-		}
-		sleepBackoff(attempt)
-	}
-}
-
-// ---------------------------------------------------------------- raw HTTP server
-
-type httpRequest struct {
-	method  string
-	path    string // decoded, no query
-	rawPath string
-	query   string
-	headers map[string]string
-	body    []byte
-	host    string
-}
-
-type httpResponse struct {
-	status int
-	ctype  string
-	extra  []string // extra header lines, already formatted "Name: value"
-	body   []byte
-	noBody bool
-}
-
-func handleConn(c net.Conn) {
-	defer c.Close()
-	br := bufio.NewReaderSize(c, 32768)
-	bw := bufio.NewWriterSize(c, 32768)
-	for {
-		req, ok := readRequest(br)
-		if !ok {
-			return
-		}
-		resp := dispatch(req)
-		if !writeResponse(bw, req, resp) {
-			return
-		}
-		if req.headers["connection"] == "close" {
-			return
-		}
-	}
-}
-
-func readRequest(br *bufio.Reader) (*httpRequest, bool) {
-	line, err := br.ReadString('\n')
-	if err != nil {
-		return nil, false
-	}
-	line = strings.TrimRight(line, "\r\n")
-	if line == "" {
-		return nil, false
-	}
-	parts := strings.SplitN(line, " ", 3)
-	if len(parts) < 3 {
-		return nil, false
-	}
-	req := &httpRequest{method: parts[0], headers: make(map[string]string, 16)}
-	rawTarget := parts[1]
-	if i := strings.IndexByte(rawTarget, '?'); i >= 0 {
-		req.rawPath = rawTarget[:i]
-		req.query = rawTarget[i+1:]
-	} else {
-		req.rawPath = rawTarget
-	}
-	req.path = urlDecodePath(req.rawPath)
-	for {
-		h, err := br.ReadString('\n')
-		if err != nil {
-			return nil, false
-		}
-		h = strings.TrimRight(h, "\r\n")
-		if h == "" {
-			break
-		}
-		if i := strings.IndexByte(h, ':'); i >= 0 {
-			req.headers[strings.ToLower(strings.TrimSpace(h[:i]))] = strings.TrimSpace(h[i+1:])
-		}
-	}
-	req.host = req.headers["host"]
-	clen := 0
-	if v, ok := req.headers["content-length"]; ok {
-		clen, _ = strconv.Atoi(v)
-	}
-	if strings.EqualFold(req.headers["transfer-encoding"], "chunked") {
-		body, ok := readChunked(br)
-		if !ok {
-			return nil, false
-		}
-		req.body = body
-	} else if clen > 0 {
-		if clen > 64*1024*1024 {
-			return nil, false
-		}
-		body := make([]byte, clen)
-		if _, err := readFull(br, body); err != nil {
-			return nil, false
-		}
-		req.body = body
-	}
-	return req, true
-}
-
-func readChunked(br *bufio.Reader) ([]byte, bool) {
-	var out []byte
-	for {
-		line, err := br.ReadString('\n')
-		if err != nil {
-			return nil, false
-		}
-		line = strings.TrimSpace(line)
-		if i := strings.IndexByte(line, ';'); i >= 0 {
-			line = line[:i]
-		}
-		n, err := strconv.ParseInt(line, 16, 64)
-		if err != nil || n < 0 {
-			return nil, false
-		}
-		if n == 0 {
-			// trailing headers until blank line
-			for {
-				h, err := br.ReadString('\n')
-				if err != nil || strings.TrimRight(h, "\r\n") == "" {
-					break
-				}
-			}
-			return out, true
-		}
-		chunk := make([]byte, n)
-		if _, err := readFull(br, chunk); err != nil {
-			return nil, false
-		}
-		out = append(out, chunk...)
-		if _, err := br.ReadString('\n'); err != nil {
-			return nil, false
-		}
-	}
-}
-
-func writeResponse(bw *bufio.Writer, req *httpRequest, resp *httpResponse) bool {
-	var sb strings.Builder
-	sb.WriteString("HTTP/1.1 ")
-	sb.WriteString(strconv.Itoa(resp.status))
-	sb.WriteString(" ")
-	sb.WriteString(statusText(resp.status))
-	sb.WriteString("\r\nContent-Type: ")
-	sb.WriteString(resp.ctype)
-	sb.WriteString("\r\nContent-Length: ")
-	if resp.noBody {
-		sb.WriteString("0")
-	} else {
-		sb.WriteString(strconv.Itoa(len(resp.body)))
-	}
-	sb.WriteString("\r\nX-GitHub-Request-Id: ")
-	sb.WriteString(nextReqID())
-	sb.WriteString("\r\n")
-	for _, h := range resp.extra {
-		sb.WriteString(h)
-		sb.WriteString("\r\n")
-	}
-	sb.WriteString("\r\n")
-	if _, err := bw.WriteString(sb.String()); err != nil {
-		return false
-	}
-	if !resp.noBody && len(resp.body) > 0 {
-		if _, err := bw.Write(resp.body); err != nil {
-			return false
-		}
-	}
-	if err := bw.Flush(); err != nil {
-		return false
-	}
-	return true
-}
-
-func statusText(code int) string {
-	switch code {
-	case 200:
-		return "OK"
-	case 201:
-		return "Created"
-	case 202:
-		return "Accepted"
-	case 204:
-		return "No Content"
-	case 400:
-		return "Bad Request"
-	case 401:
-		return "Unauthorized"
-	case 404:
-		return "Not Found"
-	case 405:
-		return "Method Not Allowed"
-	case 409:
-		return "Conflict"
-	case 422:
-		return "Unprocessable Entity"
-	default:
-		return "Status"
-	}
-}
-
-func urlDecodePath(p string) string {
-	if !strings.Contains(p, "%") {
-		return p
-	}
-	var sb strings.Builder
-	sb.Grow(len(p))
-	for i := 0; i < len(p); i++ {
-		c := p[i]
-		if c == '%' && i+2 < len(p) {
-			if v, ok := hexVal(p[i+1], p[i+2]); ok {
-				sb.WriteByte(v)
-				i += 2
-				continue
-			}
-		}
-		sb.WriteByte(c)
-	}
-	return sb.String()
-}
-
-func hexVal(a, b byte) (byte, bool) {
-	h := func(c byte) (byte, bool) {
-		switch {
-		case c >= '0' && c <= '9':
-			return c - '0', true
-		case c >= 'a' && c <= 'f':
-			return c - 'a' + 10, true
-		case c >= 'A' && c <= 'F':
-			return c - 'A' + 10, true
-		}
-		return 0, false
-	}
-	hi, ok1 := h(a)
-	lo, ok2 := h(b)
-	if !ok1 || !ok2 {
-		return 0, false
-	}
-	return hi<<4 | lo, true
-}
-
-// queryValue returns the first value of key in a URL query string.
-func queryValue(q, key string) string {
-	for q != "" {
-		var pair string
-		if i := strings.IndexByte(q, '&'); i >= 0 {
-			pair, q = q[:i], q[i+1:]
-		} else {
-			pair, q = q, ""
-		}
-		if i := strings.IndexByte(pair, '='); i >= 0 {
-			if urlDecodeQuery(pair[:i]) == key {
-				return urlDecodeQuery(pair[i+1:])
-			}
-		} else if urlDecodeQuery(pair) == key {
-			return ""
-		}
-	}
-	return ""
-}
-
-func urlDecodeQuery(s string) string {
-	if !strings.ContainsAny(s, "%+") {
-		return s
-	}
-	s = strings.ReplaceAll(s, "+", " ")
-	return urlDecodePath(s)
 }

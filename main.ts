@@ -1,29 +1,63 @@
-// Thin Node 22 launcher: the forge itself is the vendored static Go binary
-// ./forge (built in-session from the Go sources in this repo). This file only
-// spawns it, forwards stdio/env, and propagates its exit code.
-import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import path from 'node:path';
+import { spawn } from "node:child_process";
+import { chmodSync, copyFileSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const forgePath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'forge');
+// Thin launcher for the forge binary.
+//
+// The binary is copied to a fresh file in the OS temp directory and
+// made executable before it is spawned. This survives hosts that
+// strip the execute bit from uploaded files (for example a GitHub
+// web upload turning 100755 into 100644): spawning ./forge
+// directly would fail with EACCES, while the temp copy always
+// carries mode 0755. If the copy fails for any reason, fall back
+// to spawning ./forge directly.
 
-const child = spawn(forgePath, [], { stdio: 'inherit', env: process.env });
+const dir = dirname(fileURLToPath(import.meta.url));
+const forgePath = join(dir, "forge");
 
-child.on('error', (err) => {
-  process.stderr.write(`[main] failed to start forge: ${err.message}\n`);
+let runPath = forgePath;
+let tmpPath = null;
+
+try {
+  tmpPath = join(tmpdir(), `forge-${process.pid}-${Date.now()}`);
+  copyFileSync(forgePath, tmpPath);
+  chmodSync(tmpPath, 0o755);
+  runPath = tmpPath;
+} catch {
+  tmpPath = null;
+  runPath = forgePath;
+}
+
+const child = spawn(runPath, [], { stdio: "inherit", env: process.env });
+
+child.on("error", (err) => {
+  if (tmpPath) {
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // Best effort cleanup; the temp copy is harmless if it lingers.
+    }
+  }
+  console.error(`[main] failed to start forge: ${err.message}`);
   process.exit(1);
 });
 
-child.on('exit', (code, signal) => {
+child.on("exit", (code, signal) => {
+  if (tmpPath) {
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // Best effort cleanup; the temp copy is harmless if it lingers.
+    }
+  }
   if (signal) {
     process.kill(process.pid, signal);
-    return;
+  } else {
+    process.exit(code ?? 1);
   }
-  process.exit(code ?? 1);
 });
 
-for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, () => {
-    child.kill(sig);
-  });
-}
+process.on("SIGINT", () => child.kill("SIGINT"));
+process.on("SIGTERM", () => child.kill("SIGTERM"));
